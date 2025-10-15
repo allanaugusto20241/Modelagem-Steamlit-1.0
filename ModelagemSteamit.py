@@ -70,11 +70,13 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_number_maybe(s) -> float:
     """
-    Converte uma string em um número de ponto flutuante (float) de forma robusta.
+    Converte uma string ou número em um float de forma robusta, corrigindo
+    coordenadas em formato de inteiro (ex: 43561 -> 43.561).
 
     Esta função é projetada para lidar com diversos formatos numéricos que podem
     aparecer em planilhas preenchidas manualmente:
     - Já numéricos: Se o valor já for int ou float, apenas o converte para float.
+    - Formato inteiro: Converte inteiros como -22987125 para -22.987125.
     - Formato brasileiro: Converte '1.234,56' para o formato '1234.56'.
     - Espaços em branco: Remove espaços antes de tentar a conversão.
     - Texto com números: Usa expressões regulares (regex) para extrair o
@@ -89,25 +91,46 @@ def _parse_number_maybe(s) -> float:
     """
     if pd.isna(s):
         return np.nan
+
+    num_val = np.nan
     if isinstance(s, (int, float, np.number)):
-        return float(s)
-    s = str(s).strip()
-    # Verifica se há um padrão de número com vírgula decimal
-    if ',' in s and re.search(r'\d,\d', s):
-        # Converte o padrão brasileiro (ex: 1.234,50) para o padrão universal (1234.50)
-        s = s.replace('.', '').replace(',', '.')
-    s = s.replace(' ', '')
-    try:
-        return float(s)
-    except Exception:
-        # Se a conversão direta falhar, tenta extrair um número da string
-        m = re.search(r'-?\d+(?:\.\d+)?', s)
-        if m:
-            try:
-                return float(m.group(0))
-            except Exception:
+        num_val = float(s)
+    else:
+        s = str(s).strip()
+        # Verifica se há um padrão de número com vírgula decimal
+        if ',' in s and re.search(r'\d,\d', s):
+            # Converte o padrão brasileiro (ex: 1.234,50) para o padrão universal (1234.50)
+            s = s.replace('.', '').replace(',', '.')
+        s = s.replace(' ', '')
+        try:
+            num_val = float(s)
+        except Exception:
+            # Se a conversão direta falhar, tenta extrair um número da string
+            m = re.search(r'-?\d+(?:\.\d+)?', s)
+            if m:
+                try:
+                    num_val = float(m.group(0))
+                except Exception:
+                    return np.nan
+            else:
                 return np.nan
-        return np.nan
+
+    # --- INÍCIO DA LÓGICA DE CORREÇÃO DE COORDENADAS ---
+    # Se o número for um inteiro grande (fora do intervalo de coordenadas válidas),
+    # assume-se que precisa ser formatado (ex: -22987654 -> -22.987654).
+    if abs(num_val) > 180 and num_val == int(num_val):
+        sign = -1 if num_val < 0 else 1
+        s_num = str(abs(int(num_val)))
+
+        # Garante que há mais de 2 dígitos para poder dividir
+        if len(s_num) > 2:
+            integer_part = s_num[:2]
+            decimal_part = s_num[2:]
+            # Retorna o número corrigido com o sinal original
+            return sign * float(f"{integer_part}.{decimal_part}")
+    # --- FIM DA LÓGICA DE CORREÇÃO ---
+
+    return num_val
 
 def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """
