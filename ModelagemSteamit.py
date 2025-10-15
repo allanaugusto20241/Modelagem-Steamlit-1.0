@@ -43,8 +43,6 @@ import re
 from pathlib import Path
 from typing import List, Optional, Dict
 import streamlit as st
-import tkinter as tk
-from tkinter import filedialog
 # A importação mais importante para a lógica de polígonos:
 # Point: Representa um único ponto no espaço (coordenada do navio).
 # Polygon: Representa uma área bidimensional (a área do estaleiro).
