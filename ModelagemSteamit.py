@@ -70,65 +70,67 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_number_maybe(s) -> float:
     """
-    Converte uma string ou número em um float de forma robusta, corrigindo
-    coordenadas em formato de inteiro (ex: 43561 -> 43.561).
-
-    Esta função é projetada para lidar com diversos formatos numéricos que podem
-    aparecer em planilhas preenchidas manualmente:
-    - Já numéricos: Se o valor já for int ou float, apenas o converte para float.
-    - Formato inteiro: Converte inteiros como -22987125 para -22.987125.
-    - Formato brasileiro: Converte '1.234,56' para o formato '1234.56'.
-    - Espaços em branco: Remove espaços antes de tentar a conversão.
-    - Texto com números: Usa expressões regulares (regex) para extrair o
-      primeiro número válido de uma string como 'lat: -22.9'.
+    Converte uma string ou número em um float de forma robusta, lidando
+    tanto com o formato decimal padrão (ex: -43.17) quanto com o formato
+    inteiro desformatado (ex: -43172136 -> -43.172136).
 
     Args:
         s: O valor (string, int, float) a ser convertido.
 
     Returns:
-        float: O valor convertido para float, ou np.nan (Not a Number) se a
-               conversão for impossível.
+        float: O valor convertido para float, ou np.nan se a conversão for impossível.
     """
     if pd.isna(s):
         return np.nan
 
+    # ETAPA 1: Tenta converter a entrada para um número float inicial.
     num_val = np.nan
     if isinstance(s, (int, float, np.number)):
         num_val = float(s)
     else:
-        s = str(s).strip()
-        # Verifica se há um padrão de número com vírgula decimal
-        if ',' in s and re.search(r'\d,\d', s):
-            # Converte o padrão brasileiro (ex: 1.234,50) para o padrão universal (1234.50)
-            s = s.replace('.', '').replace(',', '.')
-        s = s.replace(' ', '')
+        raw_str = str(s).strip()
+        # Lida com formato brasileiro (ex: '1.234,56' -> '1234.56')
+        if ',' in raw_str and re.search(r'\d,\d', raw_str):
+            raw_str = raw_str.replace('.', '').replace(',', '.')
+        
+        raw_str = raw_str.replace(' ', '')
         try:
-            num_val = float(s)
-        except Exception:
-            # Se a conversão direta falhar, tenta extrair um número da string
-            m = re.search(r'-?\d+(?:\.\d+)?', s)
+            num_val = float(raw_str)
+        except (ValueError, TypeError):
+            # Tenta extrair um número via regex se a conversão direta falhar
+            m = re.search(r'-?\d+(?:\.\d+)?', raw_str)
             if m:
                 try:
                     num_val = float(m.group(0))
-                except Exception:
+                except (ValueError, TypeError):
                     return np.nan
             else:
                 return np.nan
 
-    # --- INÍCIO DA LÓGICA DE CORREÇÃO DE COORDENADAS ---
-    # Se o número for um inteiro grande (fora do intervalo de coordenadas válidas),
-    # assume-se que precisa ser formatado (ex: -22987654 -> -22.987654).
-    if abs(num_val) > 180 and num_val == int(num_val):
-        sign = -1 if num_val < 0 else 1
-        s_num = str(abs(int(num_val)))
+    if pd.isna(num_val):
+        return np.nan
 
-        # Garante que há mais de 2 dígitos para poder dividir
-        if len(s_num) > 2:
-            integer_part = s_num[:2]
-            decimal_part = s_num[2:]
-            # Retorna o número corrigido com o sinal original
-            return sign * float(f"{integer_part}.{decimal_part}")
-    # --- FIM DA LÓGICA DE CORREÇÃO ---
+    # ETAPA 2: Valida e, se necessário, corrige o número obtido.
+    # Uma coordenada válida tem valor absoluto <= 180.
+    # Se for maior, verificamos se é um inteiro que precisa de formatação.
+    if abs(num_val) > 180:
+        # A condição `num_val == int(num_val)` verifica se não há parte fracionária.
+        if num_val == int(num_val):
+            sign = -1 if num_val < 0 else 1
+            s_num = str(abs(int(num_val)))
+            
+            # Assume o formato DD....... (2 dígitos na parte inteira)
+            if len(s_num) > 2:
+                integer_part = s_num[:2]
+                decimal_part = s_num[2:]
+                # Reatribui o valor corrigido a num_val
+                num_val = sign * float(f"{integer_part}.{decimal_part}")
+            else:
+                # É um inteiro grande, mas muito curto para ser uma coordenada.
+                return np.nan
+        else:
+            # É um número grande com casas decimais (ex: 250.5), inválido para coordenadas.
+            return np.nan
 
     return num_val
 
@@ -466,7 +468,7 @@ if in_path is not None:
             st.download_button(
                 label="📥 Baixar Relatório em Excel",
                 data=excel_data,
-                file_name=f'modelagem_estadias_poligonos.xlsx',
+                file_name=f'modelagem_estadias_{in_path.stem}.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
     else:
