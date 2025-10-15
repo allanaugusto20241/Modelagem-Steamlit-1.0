@@ -469,5 +469,5 @@ if in_path is not None:
                 file_name=f'modelagem_estadias_poligonos.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
-        else:
-            st.warning("Nenhuma estadia foi detectada.")
+    else:
+        st.warning("Nenhuma estadia foi detectada.")
