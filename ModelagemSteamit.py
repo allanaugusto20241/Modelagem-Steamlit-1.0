@@ -468,7 +468,7 @@ if in_path is not None:
             st.download_button(
                 label="📥 Baixar Relatório em Excel",
                 data=excel_data,
-                file_name=f'modelagem_estadias_{in_path.stem}.xlsx',
+                file_name=f'modelagem_estadias_{in_path.name}.xlsx',
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
     else:
