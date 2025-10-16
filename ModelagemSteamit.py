@@ -329,28 +329,27 @@ if in_path is not None:
     # Itera sobre cada linha do DataFrame de estaleiros para construir seu polígono.
     for idx, row in est_df.iterrows():
         vertices = []
-        # Usa a função zip para parear as colunas (lat1, lon1), (lat2, lon2), etc.
+    # Usa a função zip para parear as colunas (lat1, lon1), (lat2, lon2), etc.
+    # Este loop percorre TODOS os pares de colunas lat/lon.
         for lat_c, lon_c in zip(lat_cols, lon_cols):
-            # Verifica se AMBOS os valores de latitude e longitude para este vértice existem.
-            # A função pd.notna() checa se o valor não é nulo/vazio (NaN).
+        # Apenas adiciona o vértice se AMBOS os valores de latitude e longitude
+        # para este par forem válidos (não nulos/vazios).
+        # Se um par for inválido (ex: lat3 vazio), ele é ignorado e o loop
+        # continua para o próximo par (lat4, lon4), etc.
             if pd.notna(row[lat_c]) and pd.notna(row[lon_c]):
-                # Se o par for válido, adicionamos à nossa lista de vértices.
-                # O formato exigido por shapely é uma tupla (longitude, latitude).
+            # O formato exigido por shapely é uma tupla (longitude, latitude).
                 vertices.append((row[lon_c], row[lat_c]))
-            else:
-                # Se encontrar um par inválido (ex: Lat5/Lon5 vazios),
-                # para de procurar vértices para este estaleiro e seguimos para o próximo.
-                break
 
         shipyard_name = row[yard_name_col]
-        
-        # Um polígono precisa de, no mínimo, 3 vértices.
+    
+    # Um polígono precisa de, no mínimo, 3 vértices.
         if len(vertices) >= 3:
-            # Se houver vértices suficientes, o objeto Polígono é criado e armazenado.
+        # Se houver vértices suficientes, o objeto Polígono é criado e armazenado.
             shipyard_polygons[shipyard_name] = Polygon(vertices)
         else:
-        # Caso contrário, um aviso é exibido e o estaleiro é ignorado.
+       # Caso contrário, um aviso é exibido e o estaleiro é ignorado.
             print(f"Aviso: O estaleiro '{shipyard_name}' foi ignorado por ter menos de 3 vértices válidos definidos.")
+
 
     # ETAPA 3: Verificação de Presença do Navio nos Polígonos
     # --------------------------------------------------------
