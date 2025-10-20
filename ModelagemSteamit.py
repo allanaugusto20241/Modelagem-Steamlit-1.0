@@ -229,9 +229,10 @@ def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataF
     """
     Agrupa registros de presença contíguos em "estadias" consolidadas.
 
-    O conceito de "estadia" é definido como um período em que um navio
-    permanece no mesmo local, com lacunas entre os registros de no máximo
-    `MAX_GAP_HOURS`. Se a lacuna for maior, uma nova estadia é iniciada.
+    Uma "estadia" é definida como um período ininterrupto em que um navio
+    permanece no MESMO estaleiro. Uma nova estadia é iniciada sempre que o
+    navio é detectado em um estaleiro diferente, mesmo que depois retorne
+    ao anterior.
 
     Args:
         df_in (pd.DataFrame): DataFrame com os registros de presença já filtrados.
@@ -242,39 +243,39 @@ def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataF
         pd.DataFrame: Um novo DataFrame onde cada linha representa uma estadia
                       completa, com data de entrada, saída e duração.
     """
-    MAX_GAP_HOURS = 24  # Define o tempo máximo de ausência de sinal para considerar a mesma estadia
     if df_in.empty:
         return pd.DataFrame(columns=[vessel_col, 'estaleiro', 'data_entrada', 'data_saida', 'tempo_permanencia_dias'])
-    
-    rows = []
-    # Agrupa os dados por navio e pelo estaleiro onde ele se encontra
-    for (vessel, yard), g in df_in.groupby([vessel_col, 'estaleiro'], dropna=False):
-        g = g.sort_values(date_col).reset_index(drop=True)
-        
-        # Calcula a diferença de tempo entre cada registro consecutivo
-        diffs = g[date_col].diff().fillna(pd.Timedelta(seconds=0))
-        
-        # Identifica onde uma nova "sessão" (estadia) começa.
-        # Se a diferença de tempo for maior que o limite, marca como 1, senão 0.
-        new_session = (diffs > pd.Timedelta(hours=MAX_GAP_HOURS)).astype(int)
-        
-        # A soma cumulativa (cumsum) cria um ID único para cada bloco contíguo de registros.
-        # Ex: [0, 0, 1, 0, 0, 1, 0] -> cumsum -> [0, 0, 1, 1, 1, 2, 2]
-        session_id = new_session.cumsum()
-        
-        # Agora, agrupa por este ID de sessão para consolidar cada estadia
-        for sid, gg in g.groupby(session_id):
-            entry = gg[date_col].min()  # Data de entrada é o primeiro registro da sessão
-            exit_ = gg[date_col].max() + pd.Timedelta(hours=4)   # Data de saída é o último registro da sessão adicionado em 4 horas(Instante de mudança de status do navio)
-            duration_d = (exit_ - entry).total_seconds() / 86400.0
-            rows.append({
-                vessel_col: vessel,
-                'estaleiro': yard,
-                'data_entrada': entry,
-                'data_saida': exit_,
-                'tempo_permanencia_dias': duration_d
-            })
-    return pd.DataFrame(rows)
+
+    # Garante que os dados estejam ordenados por navio e data, que é essencial
+    # para identificar a sequência correta de eventos.
+    df_sorted = df_in.sort_values([vessel_col, date_col])
+
+    # Esta é a lógica central para identificar estadias distintas e sequenciais.
+    # 1. df_sorted['estaleiro'].shift(): Pega o nome do estaleiro da linha ANTERIOR.
+    # 2. ... != df_sorted['estaleiro']: Compara com o estaleiro da linha ATUAL. O resultado
+    #    é 'True' sempre que o navio muda de local (ou para o primeiro registro de um navio).
+    # 3. .cumsum(): Transforma a sequência de True/False em um ID numérico para cada
+    #    bloco contíguo de registros no mesmo estaleiro.
+    #    Ex: [A, A, B, B, A] -> [True, False, True, False, True] -> cumsum -> [1, 1, 2, 2, 3]
+    df_sorted['stay_id'] = (df_sorted['estaleiro'].shift() != df_sorted['estaleiro']).cumsum()
+
+    # Agora, agrupamos não só pelo navio e estaleiro, mas também por este ID de estadia.
+    # Isso garante que visitas diferentes ao mesmo estaleiro sejam tratadas separadamente.
+    stays = df_sorted.groupby([vessel_col, 'estaleiro', 'stay_id']).agg(
+        data_entrada=(date_col, 'min'),
+        data_saida=(date_col, 'max')
+    ).reset_index()
+
+    # A coluna 'stay_id' foi apenas um auxiliar e pode ser removida do resultado final.
+    stays = stays.drop(columns=['stay_id'])
+
+    # Adiciona 4 horas à data de saída, como na lógica anterior.
+    stays['data_saida'] = stays['data_saida'] + pd.Timedelta(hours=4)
+
+    # Calcula a duração da estadia em dias.
+    stays['tempo_permanencia_dias'] = (stays['data_saida'] - stays['data_entrada']).dt.total_seconds() / 86400.0
+
+    return stays
 
 # --- INÍCIO DO SCRIPT PRINCIPAL ---
 
