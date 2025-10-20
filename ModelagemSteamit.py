@@ -396,7 +396,7 @@ if in_path is not None:
     # ----------------------------------------------
     # Com a localização precisa de cada ponto, agora podemos usar a função
     # `build_stays` para agrupar esses pontos em estadias significativas.
-    stays_df = build_stays(presence_df, vessel_col, date_col)
+    stays_df = build_stays(base_df, vessel_col, date_col)
 
     # ETAPA 5: Cálculo dos Períodos de Navegação
     # -------------------------------------------
