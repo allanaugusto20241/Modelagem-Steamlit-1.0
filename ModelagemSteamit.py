@@ -227,49 +227,49 @@ def _guess_cols_base(base_raw: pd.DataFrame):
 
 def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataFrame:
     """
-    Agrupa registros de presença contíguos em "estadias" consolidadas.
+    Agrupa registros de presença contíguos em "estadias" consolidadas,
+    considerando a sequência completa de localizações do navio.
 
-    Uma "estadia" é definida como um período ininterrupto em que um navio
-    permanece no MESMO estaleiro. Uma nova estadia é iniciada sempre que o
-    navio é detectado em um estaleiro diferente, mesmo que depois retorne
-    ao anterior.
+    Uma "estadia" é um período ininterrupto em um mesmo estaleiro. A função
+    usa os registros 'fora do estaleiro' para determinar corretamente o fim
+    de uma estadia e o início de um período de navegação.
 
     Args:
-        df_in (pd.DataFrame): DataFrame com os registros de presença já filtrados.
+        df_in (pd.DataFrame): O DataFrame COMPLETO com todos os registros,
+                              incluindo os 'fora do estaleiro'.
         vessel_col (str): Nome da coluna que identifica o navio.
         date_col (str): Nome da coluna de data/hora.
 
     Returns:
-        pd.DataFrame: Um novo DataFrame onde cada linha representa uma estadia
-                      completa, com data de entrada, saída e duração.
+        pd.DataFrame: DataFrame onde cada linha representa uma estadia completa.
     """
     if df_in.empty:
         return pd.DataFrame(columns=[vessel_col, 'estaleiro', 'data_entrada', 'data_saida', 'tempo_permanencia_dias'])
 
-    # Garante que os dados estejam ordenados por navio e data, que é essencial
-    # para identificar a sequência correta de eventos.
+    # Garante a ordem cronológica, essencial para a lógica de sequência.
     df_sorted = df_in.sort_values([vessel_col, date_col])
 
-    # Esta é a lógica central para identificar estadias distintas e sequenciais.
-    # 1. df_sorted['estaleiro'].shift(): Pega o nome do estaleiro da linha ANTERIOR.
-    # 2. ... != df_sorted['estaleiro']: Compara com o estaleiro da linha ATUAL. O resultado
-    #    é 'True' sempre que o navio muda de local (ou para o primeiro registro de um navio).
-    # 3. .cumsum(): Transforma a sequência de True/False em um ID numérico para cada
-    #    bloco contíguo de registros no mesmo estaleiro.
-    #    Ex: [A, A, B, B, A] -> [True, False, True, False, True] -> cumsum -> [1, 1, 2, 2, 3]
-    df_sorted['stay_id'] = (df_sorted['estaleiro'].shift() != df_sorted['estaleiro']).cumsum()
+    # Cria um ID de bloco/sessão. Um novo ID é gerado toda vez que a localização
+    # (seja um estaleiro ou 'fora do estaleiro') muda.
+    df_sorted['block_id'] = (df_sorted['estaleiro'].shift() != df_sorted['estaleiro']).cumsum()
 
-    # Agora, agrupamos não só pelo navio e estaleiro, mas também por este ID de estadia.
-    # Isso garante que visitas diferentes ao mesmo estaleiro sejam tratadas separadamente.
-    stays = df_sorted.groupby([vessel_col, 'estaleiro', 'stay_id']).agg(
+    # Agrupa por navio e pelo ID do bloco para consolidar cada período.
+    blocks = df_sorted.groupby([vessel_col, 'estaleiro', 'block_id']).agg(
         data_entrada=(date_col, 'min'),
         data_saida=(date_col, 'max')
     ).reset_index()
 
-    # A coluna 'stay_id' foi apenas um auxiliar e pode ser removida do resultado final.
-    stays = stays.drop(columns=['stay_id'])
+    # AGORA, removemos os blocos que não são estadias (os de navegação).
+    stays = blocks[blocks['estaleiro'] != 'fora do estaleiro'].copy()
 
-    # Adiciona 4 horas à data de saída, como na lógica anterior.
+    # A coluna 'block_id' foi apenas um auxiliar e pode ser removida.
+    stays = stays.drop(columns=['block_id'])
+    
+    # Se não houver estadias após o filtro, retorna um DataFrame vazio.
+    if stays.empty:
+        return pd.DataFrame(columns=[vessel_col, 'estaleiro', 'data_entrada', 'data_saida', 'tempo_permanencia_dias'])
+
+    # Adiciona 4 horas à data de saída.
     stays['data_saida'] = stays['data_saida'] + pd.Timedelta(hours=4)
 
     # Calcula a duração da estadia em dias.
