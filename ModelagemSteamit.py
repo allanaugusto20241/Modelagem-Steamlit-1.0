@@ -21,8 +21,6 @@
 #       geométricos do tipo Polígono usando a biblioteca `shapely`.
 #     - Para cada registro de localização de navio, ele verifica se o ponto
 #       (latitude, longitude) está contido dentro de algum dos polígonos.
-#     - Caso um ponto esteja em múltiplos polígonos (ex: estaleiros A e B),
-#       o script criará registros para ambos.
 #     - Agrupa os registros consecutivos dentro de um mesmo estaleiro para
 #       formar "estadias", calculando a data de entrada, saída e duração.
 #     - Calcula os períodos "em navegação" entre as estadias.
@@ -227,6 +225,38 @@ def _guess_cols_base(base_raw: pd.DataFrame):
         date_col = candidates[0] if candidates else df.columns[1]
     return df, vessel_col, date_col, lat_col, lon_col
 
+def get_all_shipyard_locations(row: pd.Series, polygons_dict: Dict[str, Polygon], lon_col: str, lat_col: str) -> List[str]:
+    """
+    Verifica TODOS os polígonos de estaleiro/baía que contêm a coordenada de um navio.
+
+    Esta função é projetada para ser usada com `df.apply()`. Ao contrário de uma
+    abordagem que retorna apenas o primeiro match, esta função coleta todos os
+    locais onde o navio pode estar simultaneamente (ex: um estaleiro dentro de uma baía).
+
+    Args:
+        row: Uma linha do DataFrame `base_df`.
+        polygons_dict: O dicionário contendo os objetos Polígono de cada estaleiro/baía.
+        lon_col: O nome da coluna de longitude do navio.
+        lat_col: O nome da coluna de latitude do navio.
+
+    Returns:
+        List[str]: Uma lista com os nomes de todos os estaleiros/baías que contêm o
+                   ponto do navio. Se o navio não estiver em nenhum polígono,
+                   a lista conterá a string 'fora do estaleiro'.
+    """
+    # Cria um objeto Point para a localização atual do navio.
+    point = Point(row[lon_col], row[lat_col])
+    locations = []
+    # Itera sobre cada polígono de estaleiro/baía.
+    for name, polygon in polygons_dict.items():
+        # A função .contains() é o núcleo da verificação geométrica.
+        # Ela retorna True se o ponto estiver dentro ou na fronteira do polígono.
+        if polygon.contains(point):
+            locations.append(name) # Adiciona o nome do local à lista.
+    
+    # Se o ponto não estiver em nenhum polígono, retorna uma lista com 'fora do estaleiro'.
+    return locations if locations else ['fora do estaleiro']
+
 def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataFrame:
     """
     Agrupa registros de presença contíguos em "estadias" consolidadas,
@@ -238,7 +268,10 @@ def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataF
 
     Args:
         df_in (pd.DataFrame): O DataFrame COMPLETO com todos os registros,
-                              incluindo os 'fora do estaleiro'.
+                              incluindo os 'fora do estaleiro'. Note que este
+                              DataFrame pode conter múltiplas linhas para o
+                              mesmo timestamp se o navio estiver em múltiplos
+                              polígonos, o que é tratado pela lógica de agrupamento.
         vessel_col (str): Nome da coluna que identifica o navio.
         date_col (str): Nome da coluna de data/hora.
 
@@ -249,19 +282,27 @@ def build_stays(df_in: pd.DataFrame, vessel_col: str, date_col: str) -> pd.DataF
         return pd.DataFrame(columns=[vessel_col, 'estaleiro', 'data_entrada', 'data_saida', 'tempo_permanencia_dias'])
 
     # Garante a ordem cronológica, essencial para a lógica de sequência.
-    df_sorted = df_in.sort_values([vessel_col, date_col])
+    # O agrupamento por 'estaleiro' aqui é crucial para diferenciar estadias
+    # em locais sobrepostos que ocorrem no mesmo timestamp.
+    df_sorted = df_in.sort_values([vessel_col, 'estaleiro', date_col])
 
     # Cria um ID de bloco/sessão. Um novo ID é gerado toda vez que a localização
-    # (seja um estaleiro ou 'fora do estaleiro') muda.
-    df_sorted['block_id'] = (df_sorted['estaleiro'].shift() != df_sorted['estaleiro']).cumsum()
+    # (seja um estaleiro ou 'fora do estaleiro') muda dentro do mesmo navio E estaleiro.
+    df_sorted['block_id'] = (
+        (df_sorted[vessel_col].shift() != df_sorted[vessel_col]) |
+        (df_sorted['estaleiro'].shift() != df_sorted['estaleiro']) |
+        (df_sorted[date_col].shift().isna() & ~df_sorted[date_col].isna()) | # Handle NaN at start of group
+        ((df_sorted[date_col] - df_sorted[date_col].shift()).dt.total_seconds() > 3600*24) # New block if gap > 24h
+    ).cumsum()
 
-    # Agrupa por navio e pelo ID do bloco para consolidar cada período.
+
+    # Agrupa por navio, estaleiro e pelo ID do bloco para consolidar cada período.
     blocks = df_sorted.groupby([vessel_col, 'estaleiro', 'block_id']).agg(
         data_entrada=(date_col, 'min'),
         data_saida=(date_col, 'max')
     ).reset_index()
 
-    # AGORA, removemos os blocos que não são estadias (os de navegação).
+    # AGORA, removemos os blocos que não são estadias (os de navegação marcados como 'fora do estaleiro').
     stays = blocks[blocks['estaleiro'] != 'fora do estaleiro'].copy()
 
     # A coluna 'block_id' foi apenas um auxiliar e pode ser removida.
@@ -296,153 +337,136 @@ if in_path is not None:
     xls = pd.ExcelFile(in_path)
 
     # Tenta encontrar os nomes das abas de forma inteligente.
-    base_sheet = _find_sheet_name(xls, ['base', 'dados']) or _find_sheet_name(xls, ['base']) or xls.sheet_names[0]
-    estaleiros_sheet = _find_sheet_name(xls, ['estaleiro']) or _find_sheet_name(xls, ['shipyard', 'yard']) or xls.sheet_names[-1]
+base_sheet = _find_sheet_name(xls, ['base', 'dados']) or _find_sheet_name(xls, ['base']) or xls.sheet_names[0]
+estaleiros_sheet = _find_sheet_name(xls, ['estaleiro', 'baia', 'shipyard', 'yard']) or xls.sheet_names[-1]
 
-    # Lê os dados das abas para DataFrames do pandas.
-    base_raw = pd.read_excel(xls, sheet_name=base_sheet)
-    estaleiros_raw = pd.read_excel(xls, sheet_name=estaleiros_sheet)
+# Lê os dados das abas para DataFrames do pandas.
+base_raw = pd.read_excel(xls, sheet_name=base_sheet)
+estaleiros_raw = pd.read_excel(xls, sheet_name=estaleiros_sheet)
 
-    # Limpa e prepara a base de dados dos navios.
-    base_df, vessel_col, date_col, base_lat, base_lon = _guess_cols_base(base_raw)
-    base_df = _coerce_numeric(base_df, [base_lat, base_lon])
-    base_df[date_col] = pd.to_datetime(base_df[date_col], errors='coerce')
-    base_df = base_df.dropna(subset=[vessel_col, date_col, base_lat, base_lon]).copy()
+# Limpa e prepara a base de dados dos navios.
+base_df, vessel_col, date_col, base_lat, base_lon = _guess_cols_base(base_raw)
+base_df = _coerce_numeric(base_df, [base_lat, base_lon])
+base_df[date_col] = pd.to_datetime(base_df[date_col], errors='coerce')
+base_df = base_df.dropna(subset=[vessel_col, date_col, base_lat, base_lon]).copy()
 
-    # ETAPA 2: Processamento dos Polígonos dos Estaleiros
-    # ----------------------------------------------------
-    # Esta é a lógica central da nova abordagem.
-    est_df = _normalize_cols(estaleiros_raw)
-    yard_name_col = _find_col(est_df.columns, 'estaleiro', 'nome', 'yard')
+# ETAPA 2: Processamento dos Polígonos dos Estaleiros
+# ----------------------------------------------------
+# Esta é a lógica central da nova abordagem.
+est_df = _normalize_cols(estaleiros_raw)
+yard_name_col = _find_col(est_df.columns, 'estaleiro', 'nome', 'yard', 'baia', 'bay')
 
-    # Encontra dinamicamente todas as colunas de vértices (lat1, lon1, lat2, etc.).
-    lat_cols = sorted([c for c in est_df.columns if c.startswith('lat')])
-    lon_cols = sorted([c for c in est_df.columns if c.startswith('lon')])
+# Encontra dinamicamente todas as colunas de vértices (lat1, lon1, lat2, etc.).
+lat_cols = sorted([c for c in est_df.columns if c.startswith('lat')])
+lon_cols = sorted([c for c in est_df.columns if c.startswith('lon')])
 
-    # Garante que todas as coordenadas dos vértices sejam numéricas.
-    est_df = _coerce_numeric(est_df, lat_cols + lon_cols)
+# Garante que todas as coordenadas dos vértices sejam numéricas.
+est_df = _coerce_numeric(est_df, lat_cols + lon_cols)
 
-    # Garante que cada estaleiro na lista tenha um nome definido, removendo linhas
-    # em que o nome do estaleiro esteja em branco.
-    est_df = est_df.dropna(subset=[yard_name_col]).copy()
+# Garante que cada estaleiro na lista tenha um nome definido, removendo linhas
+# em que o nome do estaleiro esteja em branco.
+est_df = est_df.dropna(subset=[yard_name_col]).copy()
 
-    # Cria um dicionário para armazenar os objetos Polígono.
-    shipyard_polygons = {}
+# Cria um dicionário para armazenar os objetos Polígono.
+shipyard_polygons = {}
 
-    # Itera sobre cada linha do DataFrame de estaleiros para construir seu polígono.
-    for idx, row in est_df.iterrows():
-        vertices = []
-        # Usa a função zip para parear as colunas (lat1, lon1), (lat2, lon2), etc.
-        # Este loop percorre TODOS os pares de colunas lat/lon.
-        for lat_c, lon_c in zip(lat_cols, lon_cols):
-            # Apenas adiciona o vértice se AMBOS os valores de latitude e longitude
-            # para este par forem válidos (não nulos/vazios).
-            # Se um par for inválido (ex: lat3 vazio), ele é ignorado e o loop
-            # continua para o próximo par (lat4, lon4), etc.
-            if pd.notna(row[lat_c]) and pd.notna(row[lon_c]):
-                # O formato exigido por shapely é uma tupla (longitude, latitude).
-                vertices.append((row[lon_c], row[lat_c]))
+# Itera sobre cada linha do DataFrame de estaleiros para construir seu polígono.
+for idx, row in est_df.iterrows():
+    vertices = []
+    # Usa a função zip para parear as colunas (lat1, lon1), (lat2, lon2), etc.
+    # Este loop percorre TODOS os pares de colunas lat/lon.
+    for lat_c, lon_c in zip(lat_cols, lon_cols):
+        # Apenas adiciona o vértice se AMBOS os valores de latitude e longitude
+        # para este par forem válidos (não nulos/vazios).
+        # Se um par for inválido (ex: lat3 vazio), ele é ignorado e o loop
+        # continua para o próximo par (lat4, lon4), etc.
+        if pd.notna(row[lat_c]) and pd.notna(row[lon_c]):
+            # O formato exigido por shapely é uma tupla (longitude, latitude).
+            vertices.append((row[lon_c], row[lat_c]))
 
-        shipyard_name = row[yard_name_col]
-        
-        # Um polígono precisa de, no mínimo, 3 vértices.
-        if len(vertices) >= 3:
-            # Se houver vértices suficientes, o objeto Polígono é criado e armazenado.
-            shipyard_polygons[shipyard_name] = Polygon(vertices)
-        else:
-        # Caso contrário, um aviso é exibido e o estaleiro é ignorado.
-            print(f"Aviso: O estaleiro '{shipyard_name}' foi ignorado por ter menos de 3 vértices válidos definidos.")
-
-    # ETAPA 3: Verificação de Presença do Navio nos Polígonos
-    # --------------------------------------------------------
+    shipyard_name = row[yard_name_col]
     
-    # --- ALTERAÇÃO 1: A função agora retorna uma LISTA de estaleiros, não apenas o primeiro. ---
-    def get_shipyard_locations(row: pd.Series, polygons_dict: Dict[str, Polygon], lon_col: str, lat_col: str) -> List[str]:
-        """
-        Verifica se a coordenada de um navio está dentro de algum polígono de estaleiro
-        e retorna uma lista de todos os estaleiros correspondentes.
-
-        Args:
-            row: Uma linha do DataFrame `base_df`.
-            polygons_dict: O dicionário contendo os objetos Polígono de cada estaleiro.
-            lon_col: O nome da coluna de longitude do navio.
-            lat_col: O nome da coluna de latitude do navio.
-
-        Returns:
-            List[str]: Uma lista com os nomes de todos os estaleiros onde o navio está.
-                       Retorna uma lista vazia se não estiver em nenhum.
-        """
-        point = Point(row[lon_col], row[lat_col])
-        found_locations = []
-        # Itera sobre cada polígono de estaleiro.
-        for name, polygon in polygons_dict.items():
-            # A função .contains() é o núcleo da verificação geométrica.
-            if polygon.contains(point):
-                found_locations.append(name) # Adiciona o nome à lista, em vez de retornar.
-        return found_locations
-
-    # Aplica a função de verificação a cada linha. A coluna 'estaleiro' agora conterá listas.
-    base_df['estaleiro'] = base_df.apply(
-        get_shipyard_locations, # Nome da função atualizado
-        args=(shipyard_polygons, base_lon, base_lat),
-        axis=1
-    )
-
-    # --- ALTERAÇÃO 2: Explode o DataFrame para criar uma linha para cada estaleiro na lista. ---
-    # Se uma linha tem ['Estaleiro A', 'Estaleiro B'], ela será transformada em duas linhas.
-    base_df = base_df.explode('estaleiro')
-
-    # --- ALTERAÇÃO 3: Preenche os registros que não estavam em nenhum estaleiro. ---
-    # Após o explode, linhas que tinham uma lista vazia terão 'NaN' na coluna 'estaleiro'.
-    # Substituímos por 'fora do estaleiro' para manter a lógica do script.
-    base_df['estaleiro'] = base_df['estaleiro'].fillna('fora do estaleiro')
-
-
-    # Cria o DataFrame `presence_df` contendo apenas os registros onde o navio
-    # foi detectado dentro de um estaleiro.
-    presence_df = base_df[base_df['estaleiro'] != 'fora do estaleiro'].copy()
-
-    # ETAPA 4: Construção das Estadias Consolidadas
-    # ----------------------------------------------
-    # A função `build_stays` agora recebe o DataFrame completo (`base_df`)
-    # para analisar a sequência cronológica real, incluindo os períodos de navegação.
-    stays_df = build_stays(base_df, vessel_col, date_col)
-
-    # ETAPA 5: Cálculo dos Períodos de Navegação
-    # -------------------------------------------
-    # Esta etapa analisa as lacunas de tempo ENTRE as estadias para identificar
-    # quando os navios estavam se movendo de um local para outro.
-    navigation_records = []
-    if not stays_df.empty:
-        stays_df_sorted = stays_df.sort_values([vessel_col, 'data_entrada']).reset_index(drop=True)
-        # Agrupa por navio para analisar a sequência de estadias de cada um.
-        for vessel_name, group in stays_df_sorted.groupby(vessel_col):
-            # A função .shift(1) "puxa" o valor da linha anterior para a linha atual.
-            # Isso nos permite comparar a estadia atual com a anterior do mesmo navio.
-            previous_exit_time = group['data_saida'].shift(1)
-            for idx, row in group.iterrows():
-                if pd.notna(previous_exit_time.loc[idx]):
-                    current_entry_time = row['data_entrada']
-                    prev_exit = previous_exit_time.loc[idx]
-                    
-                    # Se a entrada na estadia atual é posterior à saída da anterior,
-                    # o tempo entre elas foi um período de navegação.
-                    if current_entry_time > prev_exit:
-                        duration_d = (current_entry_time - prev_exit).total_seconds() / 86400.0
-                        navigation_records.append({
-                            vessel_col: vessel_name,
-                            'estaleiro': 'em navegação',
-                            'data_entrada': prev_exit,
-                            'data_saida': current_entry_time,
-                            'tempo_permanencia_dias': duration_d
-                        })
-
-    # Junta os dados de estadias com os de navegação em um único DataFrame.
-    if navigation_records:
-        navigation_df = pd.DataFrame(navigation_records)
-        combined_df = pd.concat([stays_df, navigation_df], ignore_index=True)
+    # Um polígono precisa de, no mínimo, 3 vértices.
+    if len(vertices) >= 3:
+        # Se houver vértices suficientes, o objeto Polígono é criado e armazenado.
+        shipyard_polygons[shipyard_name] = Polygon(vertices)
     else:
-        combined_df = stays_df
+       # Caso contrário, um aviso é exibido e o estaleiro é ignorado.
+        print(f"Aviso: O local '{shipyard_name}' foi ignorado por ter menos de 3 vértices válidos definidos.")
+
+# ETAPA 3: Verificação de Presença do Navio nos Polígonos (Adaptada para Múltiplas Localizações)
+# ------------------------------------------------------------------------------------------------
+# Aplica a função de verificação a cada linha do DataFrame de navios.
+# O resultado é uma nova coluna 'estaleiro_list' que armazena UMA LISTA de todas
+# as localizações (estaleiros/baías) em que o navio se encontra para cada registro.
+# `axis=1` garante que a função receba cada linha individualmente.
+base_df['estaleiro_list'] = base_df.apply(
+    get_all_shipyard_locations,
+    args=(shipyard_polygons, base_lon, base_lat), # Argumentos extras para a função
+    axis=1
+)
+
+# O passo crucial para lidar com múltiplas localizações simultâneas:
+# O método `.explode()` transforma cada elemento da lista em 'estaleiro_list' em uma nova linha.
+# Por exemplo, se um navio está em 'Baía X' e 'Estaleiro Y' ao mesmo tempo,
+# ele gerará duas linhas idênticas (exceto pela coluna 'estaleiro_list'),
+# uma para cada localização. Isso permite que o cálculo de estadias seja feito
+# independentemente para cada local, mesmo que ocorram no mesmo timestamp.
+base_df = base_df.explode('estaleiro_list', ignore_index=True)
+
+# Renomeia a coluna temporária 'estaleiro_list' para 'estaleiro' para consistência
+# com o resto do script e para que a função `build_stays` a utilize corretamente.
+base_df = base_df.rename(columns={'estaleiro_list': 'estaleiro'})
+
+# Cria o DataFrame `presence_df` contendo apenas os registros onde o navio
+# foi detectado dentro de um estaleiro/baía. Note que, após o explode,
+# `base_df` já contém as múltiplas entradas para locais sobrepostos.
+presence_df = base_df[base_df['estaleiro'] != 'fora do estaleiro'].copy()
+
+# ETAPA 4: Construção das Estadias Consolidadas
+# ----------------------------------------------
+# A função `build_stays` agora recebe o DataFrame completo (`base_df`)
+# que já contém as entradas expandidas para múltiplas localizações simultâneas,
+# garantindo que cada estadia (mesmo que sobreposta) seja contabilizada.
+stays_df = build_stays(base_df, vessel_col, date_col)
+
+# ETAPA 5: Cálculo dos Períodos de Navegação
+# -------------------------------------------
+# Esta etapa analisa as lacunas de tempo ENTRE as estadias para identificar
+# quando os navios estavam se movendo de um local para outro.
+navigation_records = []
+if not stays_df.empty:
+    # Ordena novamente por navio e data para garantir a sequência correta
+    # ao comparar estadias adjacentes para um mesmo navio.
+    stays_df_sorted = stays_df.sort_values([vessel_col, 'data_entrada']).reset_index(drop=True)
+    # Agrupa por navio para analisar a sequência de estadias de cada um.
+    for vessel_name, group in stays_df_sorted.groupby(vessel_col):
+        # A função .shift(1) "puxa" o valor da linha anterior para a linha atual.
+        # Isso nos permite comparar a estadia atual com a anterior do mesmo navio.
+        previous_exit_time = group['data_saida'].shift(1)
+        for idx, row in group.iterrows():
+            if pd.notna(previous_exit_time.loc[idx]):
+                current_entry_time = row['data_entrada']
+                prev_exit = previous_exit_time.loc[idx]
+                
+                # Se a entrada na estadia atual é posterior à saída da anterior,
+                # o tempo entre elas foi um período de navegação.
+                if current_entry_time > prev_exit:
+                    duration_d = (current_entry_time - prev_exit).total_seconds() / 86400.0
+                    navigation_records.append({
+                        vessel_col: vessel_name,
+                        'estaleiro': 'em navegação',
+                        'data_entrada': prev_exit,
+                        'data_saida': current_entry_time,
+                        'tempo_permanencia_dias': duration_d
+                    })
+
+# Junta os dados de estadias com os de navegação em um único DataFrame.
+if navigation_records:
+    navigation_df = pd.DataFrame(navigation_records)
+    combined_df = pd.concat([stays_df, navigation_df], ignore_index=True)
+else:
+    combined_df = stays_df
 
     # ETAPA 6: Formatação Final e Exportação do Relatório
     # ---------------------------------------------------
@@ -479,7 +503,7 @@ if in_path is not None:
                 label="📥 Baixar Relatório em Excel",
                 data=excel_data,
                 file_name=f'modelagem_estadias_{in_path.name}',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheet.sheet'
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             )
     else:
         st.warning("Nenhuma estadia foi detectada.")
