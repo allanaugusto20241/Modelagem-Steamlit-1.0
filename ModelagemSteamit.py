@@ -21,6 +21,8 @@
 #       geométricos do tipo Polígono usando a biblioteca `shapely`.
 #     - Para cada registro de localização de navio, ele verifica se o ponto
 #       (latitude, longitude) está contido dentro de algum dos polígonos.
+#     - Caso um ponto esteja em múltiplos polígonos (ex: estaleiros A e B),
+#       o script criará registros para ambos.
 #     - Agrupa os registros consecutivos dentro de um mesmo estaleiro para
 #       formar "estadias", calculando a data de entrada, saída e duração.
 #     - Calcula os períodos "em navegação" entre as estadias.
@@ -353,11 +355,12 @@ if in_path is not None:
 
     # ETAPA 3: Verificação de Presença do Navio nos Polígonos
     # --------------------------------------------------------
-    def get_shipyard_location(row: pd.Series, polygons_dict: Dict[str, Polygon], lon_col: str, lat_col: str) -> str:
+    
+    # --- ALTERAÇÃO 1: A função agora retorna uma LISTA de estaleiros, não apenas o primeiro. ---
+    def get_shipyard_locations(row: pd.Series, polygons_dict: Dict[str, Polygon], lon_col: str, lat_col: str) -> List[str]:
         """
-        Verifica se a coordenada de um navio está dentro de algum polígono de estaleiro.
-
-        Esta função é projetada para ser usada com `df.apply()`.
+        Verifica se a coordenada de um navio está dentro de algum polígono de estaleiro
+        e retorna uma lista de todos os estaleiros correspondentes.
 
         Args:
             row: Uma linha do DataFrame `base_df`.
@@ -366,26 +369,34 @@ if in_path is not None:
             lat_col: O nome da coluna de latitude do navio.
 
         Returns:
-            str: O nome do estaleiro se o navio estiver dentro de um, ou 'fora do estaleiro'.
+            List[str]: Uma lista com os nomes de todos os estaleiros onde o navio está.
+                       Retorna uma lista vazia se não estiver em nenhum.
         """
-        # Cria um objeto Point para a localização atual do navio.
         point = Point(row[lon_col], row[lat_col])
+        found_locations = []
         # Itera sobre cada polígono de estaleiro.
         for name, polygon in polygons_dict.items():
             # A função .contains() é o núcleo da verificação geométrica.
-            # Ela retorna True se o ponto estiver dentro ou na fronteira do polígono.
             if polygon.contains(point):
-                return name  # Retorna o nome do estaleiro e para a verificação.
-        return 'fora do estaleiro'
+                found_locations.append(name) # Adiciona o nome à lista, em vez de retornar.
+        return found_locations
 
-    # Aplica a função de verificação a cada linha do DataFrame de navios.
-    # O resultado é uma nova coluna 'estaleiro' que armazena a localização de cada registro.
-    # `axis=1` garante que a função receba cada linha individualmente.
+    # Aplica a função de verificação a cada linha. A coluna 'estaleiro' agora conterá listas.
     base_df['estaleiro'] = base_df.apply(
-        get_shipyard_location,
-        args=(shipyard_polygons, base_lon, base_lat), # Argumentos extras para a função
+        get_shipyard_locations, # Nome da função atualizado
+        args=(shipyard_polygons, base_lon, base_lat),
         axis=1
     )
+
+    # --- ALTERAÇÃO 2: Explode o DataFrame para criar uma linha para cada estaleiro na lista. ---
+    # Se uma linha tem ['Estaleiro A', 'Estaleiro B'], ela será transformada em duas linhas.
+    base_df = base_df.explode('estaleiro')
+
+    # --- ALTERAÇÃO 3: Preenche os registros que não estavam em nenhum estaleiro. ---
+    # Após o explode, linhas que tinham uma lista vazia terão 'NaN' na coluna 'estaleiro'.
+    # Substituímos por 'fora do estaleiro' para manter a lógica do script.
+    base_df['estaleiro'] = base_df['estaleiro'].fillna('fora do estaleiro')
+
 
     # Cria o DataFrame `presence_df` contendo apenas os registros onde o navio
     # foi detectado dentro de um estaleiro.
@@ -468,7 +479,7 @@ if in_path is not None:
                 label="📥 Baixar Relatório em Excel",
                 data=excel_data,
                 file_name=f'modelagem_estadias_{in_path.name}',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                mime='application/vnd.openxmlformats-officedocument.spreadsheet.sheet'
             )
     else:
         st.warning("Nenhuma estadia foi detectada.")
